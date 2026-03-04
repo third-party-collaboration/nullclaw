@@ -84,6 +84,8 @@ const ChannelSelection = struct {
     enable_channel_qq: bool = false,
     enable_channel_maixcam: bool = false,
     enable_channel_signal: bool = false,
+    enable_channel_nostr: bool = false,
+    enable_channel_web: bool = false,
 
     fn enableAll(self: *ChannelSelection) void {
         self.enable_channel_cli = true;
@@ -103,6 +105,8 @@ const ChannelSelection = struct {
         self.enable_channel_qq = true;
         self.enable_channel_maixcam = true;
         self.enable_channel_signal = true;
+        self.enable_channel_nostr = true;
+        self.enable_channel_web = true;
     }
 };
 
@@ -170,6 +174,10 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_maixcam = true;
         } else if (std.mem.eql(u8, token, "signal")) {
             selection.enable_channel_signal = true;
+        } else if (std.mem.eql(u8, token, "nostr")) {
+            selection.enable_channel_nostr = true;
+        } else if (std.mem.eql(u8, token, "web")) {
+            selection.enable_channel_web = true;
         } else {
             std.log.err("unknown channel '{s}' in -Dchannels list", .{token});
             return error.InvalidChannelsOption;
@@ -307,11 +315,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
-    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.26";
+    const is_static = b.option(bool, "static", "Static build") orelse false;
+    const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.3.3";
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -359,6 +368,8 @@ pub fn build(b: *std.Build) void {
     const enable_channel_qq = channels.enable_channel_qq;
     const enable_channel_maixcam = channels.enable_channel_maixcam;
     const enable_channel_signal = channels.enable_channel_signal;
+    const enable_channel_nostr = channels.enable_channel_nostr;
+    const enable_channel_web = channels.enable_channel_web;
 
     const effective_enable_memory_sqlite = enable_sqlite and enable_memory_sqlite;
     const effective_enable_memory_lucid = enable_sqlite and enable_memory_lucid;
@@ -410,6 +421,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_qq", enable_channel_qq);
     build_options.addOption(bool, "enable_channel_maixcam", enable_channel_maixcam);
     build_options.addOption(bool, "enable_channel_signal", enable_channel_signal);
+    build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
+    build_options.addOption(bool, "enable_channel_web", enable_channel_web);
     const build_options_module = build_options.createModule();
 
     // ---------- library module (importable by consumers) ----------
@@ -426,6 +439,13 @@ pub fn build(b: *std.Build) void {
         if (enable_postgres) {
             module.linkSystemLibrary("pq", .{});
         }
+        if (enable_channel_web) {
+            const ws_dep = b.dependency("websocket", .{
+                .target = target,
+                .optimize = optimize,
+            });
+            module.addImport("websocket", ws_dep.module("websocket"));
+        }
         break :blk module;
     };
 
@@ -435,15 +455,23 @@ pub fn build(b: *std.Build) void {
     else
         &.{.{ .name = "nullclaw", .module = lib_mod.? }};
 
-    const exe = b.addExecutable(.{
-        .name = "nullclaw",
-        .root_module = b.createModule(.{
-            .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = exe_imports,
-        }),
+    const exe_root_module = b.createModule(.{
+        .root_source_file = if (is_wasi) b.path("src/main_wasi.zig") else b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = exe_imports,
     });
+    const exe = if (is_static)
+        b.addExecutable(.{
+            .name = "nullclaw",
+            .root_module = exe_root_module,
+            .linkage = .static,
+        })
+    else
+        b.addExecutable(.{
+            .name = "nullclaw",
+            .root_module = exe_root_module,
+        });
     exe.root_module.addImport("build_options", build_options_module);
 
     // Link SQLite on the compile step (not the module)

@@ -51,7 +51,10 @@ pub const ShellTool = struct {
                 return switch (err) {
                     error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
-                    error.ApprovalRequired => ToolResult.fail("Command requires approval (medium/high risk)"),
+                    error.ApprovalRequired => blk: {
+                        const msg = try std.fmt.allocPrint(allocator, "Command requires approval (medium/high risk): {s}", .{command});
+                        break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    },
                 };
             };
         }
@@ -339,4 +342,117 @@ test "shell cwd with allowed_paths runs in cwd" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
+}
+
+test "shell ApprovalRequired error includes command name" {
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
+    defer tracker.deinit();
+    const allowed = [_][]const u8{ "git", "ls", "cat", "grep", "echo", "touch" };
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .require_approval_for_medium_risk = true,
+        .block_high_risk_commands = false,
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"touch test.txt\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    defer std.testing.allocator.free(result.error_msg.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "touch test.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "approval") != null);
+}
+
+test "shell ApprovalRequired propagates oom for error message allocation" {
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
+    defer tracker.deinit();
+    const allowed = [_][]const u8{ "git", "ls", "cat", "grep", "echo", "touch" };
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .require_approval_for_medium_risk = true,
+        .block_high_risk_commands = false,
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"touch test.txt\"}");
+    defer parsed.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        st.execute(failing.allocator(), parsed.value.object),
+    );
+}
+
+test "shell wildcard policy permits command outside default allowlist" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var restrictive_tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer restrictive_tracker.deinit();
+    var restrictive_policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &policy_mod.default_allowed_commands,
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &restrictive_tracker,
+    };
+
+    var restrictive_tool = ShellTool{ .workspace_dir = "/tmp", .policy = &restrictive_policy };
+    const restricted_args = try root.parseTestArgs("{\"command\": \"true\"}");
+    defer restricted_args.deinit();
+    const restricted = try restrictive_tool.execute(std.testing.allocator, restricted_args.value.object);
+    defer if (restricted.output.len > 0) std.testing.allocator.free(restricted.output);
+    try std.testing.expect(!restricted.success);
+    try std.testing.expect(restricted.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, restricted.error_msg.?, "Command not allowed") != null);
+
+    var wildcard_tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer wildcard_tracker.deinit();
+    var wildcard_policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &wildcard_tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &wildcard_policy };
+
+    const parsed = try root.parseTestArgs("{\"command\": \"true\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+}
+
+test "shell without policy executes command" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = null };
+
+    const parsed = try root.parseTestArgs("{\"command\": \"echo no-policy\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
 }

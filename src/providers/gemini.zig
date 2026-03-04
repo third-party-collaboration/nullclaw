@@ -3,6 +3,7 @@ const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
+const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
@@ -368,15 +369,15 @@ pub const GeminiProvider = struct {
         // 2. Environment variables (only if no explicit key)
         if (auth == null) {
             if (loadNonEmptyEnv(allocator, "GEMINI_API_KEY")) |value| {
-                allocator.free(value);
-                auth = .{ .env_gemini_key = "env" };
+                auth = .{ .env_gemini_key = value };
+                // Note: value is NOT freed — ownership transfers to auth
             }
         }
 
         if (auth == null) {
             if (loadNonEmptyEnv(allocator, "GOOGLE_API_KEY")) |value| {
-                allocator.free(value);
-                auth = .{ .env_google_key = "env" };
+                auth = .{ .env_google_key = value };
+                // Note: value is NOT freed — ownership transfers to auth
             }
         }
 
@@ -658,6 +659,17 @@ pub const GeminiProvider = struct {
         argv_buf[argc] = "Content-Type: application/json";
         argc += 1;
 
+        // Add proxy from environment if set
+        const proxy = http_util.getProxyFromEnv(allocator) catch null;
+        defer if (proxy) |p| allocator.free(p);
+
+        if (proxy) |p| {
+            argv_buf[argc] = "--proxy";
+            argc += 1;
+            argv_buf[argc] = p;
+            argc += 1;
+        }
+
         for (headers) |hdr| {
             argv_buf[argc] = "-H";
             argc += 1;
@@ -795,11 +807,11 @@ pub const GeminiProvider = struct {
         defer allocator.free(body);
 
         const resp_body = if (auth.isApiKey())
-            root.curlPost(allocator, url, body, &.{}) catch return error.GeminiApiError
+            root.curlPostTimed(allocator, url, body, &.{}, 0) catch return error.GeminiApiError
         else blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.GeminiApiError;
+            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, 0) catch return error.GeminiApiError;
         };
         defer allocator.free(resp_body);
 
@@ -851,6 +863,8 @@ pub const GeminiProvider = struct {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
         if (self.auth) |auth| {
             switch (auth) {
+                .env_gemini_key => |key| self.allocator.free(key),
+                .env_google_key => |key| self.allocator.free(key),
                 .env_oauth_token => |tok| self.allocator.free(tok),
                 .oauth_token => |tok| self.allocator.free(tok),
                 else => {},
@@ -991,6 +1005,8 @@ fn buildChatRequestBody(
 test "provider creates without key" {
     const p = GeminiProvider.init(std.testing.allocator, null);
     defer if (p.auth) |a| switch (a) {
+        .env_gemini_key => |key| std.testing.allocator.free(key),
+        .env_google_key => |key| std.testing.allocator.free(key),
         .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},
@@ -1007,6 +1023,8 @@ test "provider creates with key" {
 test "provider rejects empty key" {
     const p = GeminiProvider.init(std.testing.allocator, "");
     defer if (p.auth) |a| switch (a) {
+        .env_gemini_key => |key| std.testing.allocator.free(key),
+        .env_google_key => |key| std.testing.allocator.free(key),
         .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},
@@ -1134,6 +1152,8 @@ test "parseResponse multiple parts returns first text" {
 test "provider rejects whitespace key" {
     const p = GeminiProvider.init(std.testing.allocator, "   ");
     defer if (p.auth) |a| switch (a) {
+        .env_gemini_key => |key| std.testing.allocator.free(key),
+        .env_google_key => |key| std.testing.allocator.free(key),
         .env_oauth_token => |tok| std.testing.allocator.free(tok),
         .oauth_token => |tok| std.testing.allocator.free(tok),
         else => {},

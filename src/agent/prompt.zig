@@ -4,6 +4,8 @@ const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
+const bootstrap_mod = @import("../bootstrap/root.zig");
+const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // System Prompt Builder
@@ -122,6 +124,7 @@ pub const PromptContext = struct {
     tools: []const Tool,
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
+    bootstrap_provider: ?BootstrapProvider = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -129,7 +132,14 @@ pub const PromptContext = struct {
 pub fn workspacePromptFingerprint(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !u64 {
+    // When a bootstrap provider is available, delegate fingerprinting to it.
+    if (bootstrap_provider) |bp| {
+        return bp.fingerprint(allocator);
+    }
+
+    // Fallback: file-based fingerprinting.
     var hasher = std.hash.Fnv1a_64.init();
     const tracked_files = [_][]const u8{
         "AGENTS.md",
@@ -187,7 +197,7 @@ pub fn buildSystemPrompt(
     const w = buf.writer(allocator);
 
     // Identity section — inject workspace MD files
-    try buildIdentitySection(allocator, w, ctx.workspace_dir);
+    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider);
 
     // Tools section
     try buildToolsSection(w, ctx.tools);
@@ -235,6 +245,48 @@ pub fn buildSystemPrompt(
     try w.writeAll("- When in doubt, ask before acting externally.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
 
+    // Group chat behavior section (Telegram-only for now).
+    // The [NO_REPLY] marker is currently suppressed only by the Telegram loop.
+    if (ctx.conversation_context) |cc| {
+        const is_telegram = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "telegram") else false;
+        if (is_telegram and cc.is_group != null and cc.is_group.?) {
+            try w.writeAll("## Group Chat Behavior\n\n");
+            try w.writeAll("You are in a group chat. Not every message requires a response.\n\n");
+            try w.writeAll("Use the `[NO_REPLY]` marker when:\n");
+            try w.writeAll("- The message is casual chat between other members\n");
+            try w.writeAll("- The message is not directed at you (no question, no @mention)\n");
+            try w.writeAll("- The message is a simple acknowledgment (ok, thanks, haha, etc.)\n");
+            try w.writeAll("- You have nothing meaningful to add to the conversation\n\n");
+            try w.writeAll("When you choose NOT to reply, include `[NO_REPLY]` anywhere in your response. The system will suppress the message.\n\n");
+            try w.writeAll("Examples of when to use `[NO_REPLY]`:\n");
+            try w.writeAll("- \"Anyone online?\" -> `[NO_REPLY]` (unless you're specifically needed)\n");
+            try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");
+            try w.writeAll("- General chit-chat between other members -> `[NO_REPLY]`\n\n");
+
+            // Add schedule tool guidance for Telegram group chats.
+            try w.writeAll("## Scheduled Tasks in Groups\n\n");
+            try w.writeAll("When using the `schedule` tool to create reminders in this group:\n");
+            try w.writeAll("1. Use SIMPLE command like: `echo \"Time is up!\"` or `date`\n");
+            try w.writeAll("2. ALWAYS use double quotes (\") for the command string, not single quotes\n");
+            try w.writeAll("3. The system will AUTOMATICALLY send the result to this group\n");
+            try w.writeAll("4. DO NOT use curl, say, or other methods to send messages manually\n");
+            try w.writeAll("5. DO NOT add any extra commands - just the basic echo\n\n");
+            if (cc.group_id) |gid| {
+                try std.fmt.format(w, "Current group ID: `{s}`\n\n", .{gid});
+            }
+            try w.writeAll("Good example (simple, double quotes):\n");
+            try w.writeAll("```\nschedule action=once delay=30m command=\"echo \\\"Time is up!\\\"\"\n```\n\n");
+            try w.writeAll("The command output will be automatically delivered to this chat.\n\n");
+        }
+    }
+
+    // Schedule tool guidance for all contexts (including private chats)
+    try w.writeAll("## Scheduled Tasks\n\n");
+    try w.writeAll("When using the `schedule` tool to create reminders:\n");
+    try w.writeAll("- ALWAYS use double quotes (\") for the command string\n");
+    try w.writeAll("- Example: `echo \"Time is up!\"`\n");
+    try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
+
     // Skills section
     try appendSkillsSection(allocator, w, ctx.workspace_dir);
 
@@ -257,6 +309,7 @@ fn buildIdentitySection(
     allocator: std.mem.Allocator,
     w: anytype,
     workspace_dir: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !void {
     try w.writeAll("## Project Context\n\n");
     try w.writeAll("The following workspace files define your identity, behavior, and context.\n\n");
@@ -275,11 +328,11 @@ fn buildIdentitySection(
     };
 
     for (identity_files) |filename| {
-        try injectWorkspaceFile(allocator, w, workspace_dir, filename);
+        try injectWorkspaceFile(allocator, w, workspace_dir, filename, bootstrap_provider);
     }
 
     // Inject MEMORY.md if present, otherwise fallback to memory.md.
-    try injectPreferredMemoryFile(allocator, w, workspace_dir);
+    try injectPreferredMemoryFile(allocator, w, workspace_dir, bootstrap_provider);
 }
 
 test "buildSystemPrompt includes SOUL persona guidance" {
@@ -391,6 +444,18 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("- Image/video/audio/voice: `[IMAGE:/abs/path]`, `[VIDEO:/abs/path]`, `[AUDIO:/abs/path]`, `[VOICE:/abs/path]`\n");
     try w.writeAll("- If user gives `~/...`, expand it to the absolute home path before sending.\n");
     try w.writeAll("- Do not claim attachment sending is unavailable when these markers are supported.\n\n");
+
+    try w.writeAll("## Channel Choices\n\n");
+    try w.writeAll("- On supported channels (for example Telegram when enabled), append `<nc_choices>...</nc_choices>` at the end of the final reply to render short button choices when you are asking the user to choose among short options.\n");
+    try w.writeAll("- Always keep the normal visible question text before the choices block.\n");
+    try w.writeAll("- Use choices only for short mutually exclusive branches (for example yes/no or A/B).\n");
+    try w.writeAll("- Do not use choices for long lists, open-ended prompts, or complex multi-step forms.\n");
+    try w.writeAll("- If you ask the user to pick one of 2-4 short explicit options (for example yes/no/cancel, A/B, or quoted command replies), you MUST append a choices block unless the user explicitly asked for plain text only.\n");
+    try w.writeAll("- If you present a numbered or bulleted list of 2-4 mutually exclusive reply options, include matching choices for those same options.\n");
+    try w.writeAll("- The JSON must be valid and use `{\"v\":1,\"options\":[...]}` with 2-6 options.\n");
+    try w.writeAll("- Each option must include `id` and `label`; `submit_text` is optional (if omitted, label is used as submit text).\n");
+    try w.writeAll("- `id` must be lowercase and contain only `a-z`, `0-9`, `_`, `-` (example: `yes`, `no`, `later_10m`).\n");
+    try w.writeAll("- Example: `<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\"}]}</nc_choices>`\n\n");
 }
 
 fn writeXmlEscapedAttrValue(w: anytype, value: []const u8) !void {
@@ -522,7 +587,20 @@ fn injectWorkspaceFile(
     w: anytype,
     workspace_dir: []const u8,
     filename: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !void {
+    // Try bootstrap provider first when available.
+    if (bootstrap_provider) |bp| {
+        const content = bp.load(allocator, filename) catch null;
+        if (content) |c| {
+            defer allocator.free(c);
+            try appendPromptSectionContent(w, filename, c);
+            return;
+        }
+        // Provider returned null — fall through to file-based path.
+    }
+
+    // Fallback: direct file read.
     const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
     if (opened == null) {
         try std.fmt.format(w, "### {s}\n\n[File not found: {s}]\n\n", .{ filename, filename });
@@ -573,7 +651,23 @@ fn injectPreferredMemoryFile(
     allocator: std.mem.Allocator,
     w: anytype,
     workspace_dir: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !void {
+    // When bootstrap provider is available, try loading MEMORY.md through it.
+    if (bootstrap_provider) |bp| {
+        const memory_files = [_][]const u8{ "MEMORY.md", "memory.md" };
+        for (memory_files) |filename| {
+            const content = bp.load(allocator, filename) catch null;
+            if (content) |c| {
+                defer allocator.free(c);
+                try appendPromptSectionContent(w, filename, c);
+                return; // Found via provider, done.
+            }
+        }
+        // Provider returned null for all variants — fall through to file-based path.
+    }
+
+    // Fallback: direct file-based injection.
     var seen_memory_paths: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it = seen_memory_paths.keyIterator();
@@ -663,6 +757,44 @@ test "buildSystemPrompt includes channel attachment marker guidance" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Attachments") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[FILE:/absolute/path/to/file.ext]") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not claim attachment sending is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Choices") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<nc_choices>") != null);
+}
+
+test "buildSystemPrompt omits telegram-only group marker guidance for non-telegram groups" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "signal",
+            .is_group = true,
+            .group_id = "group-1",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Group Chat Behavior") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[NO_REPLY]") == null);
+}
+
+test "buildSystemPrompt includes telegram group marker guidance for telegram groups" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "telegram",
+            .is_group = true,
+            .group_id = "-100123",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Group Chat Behavior") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[NO_REPLY]") != null);
 }
 
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {
@@ -800,8 +932,8 @@ test "workspacePromptFingerprint is stable when files are unchanged" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace);
-    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expectEqual(fp1, fp2);
 }
 
@@ -818,7 +950,7 @@ test "workspacePromptFingerprint changes when tracked file changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
@@ -826,7 +958,7 @@ test "workspacePromptFingerprint changes when tracked file changes" {
         try f.writeAll("longer-content-after-change");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -843,7 +975,7 @@ test "workspacePromptFingerprint changes when MEMORY.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("MEMORY.md", .{ .truncate = true });
@@ -851,7 +983,7 @@ test "workspacePromptFingerprint changes when MEMORY.md changes" {
         try f.writeAll("memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -868,7 +1000,7 @@ test "workspacePromptFingerprint changes when memory.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("memory.md", .{ .truncate = true });
@@ -876,7 +1008,7 @@ test "workspacePromptFingerprint changes when memory.md changes" {
         try f.writeAll("alt-memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -893,7 +1025,7 @@ test "workspacePromptFingerprint changes when BOOTSTRAP.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("BOOTSTRAP.md", .{ .truncate = true });
@@ -901,7 +1033,7 @@ test "workspacePromptFingerprint changes when BOOTSTRAP.md changes" {
         try f.writeAll("bootstrap-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -918,7 +1050,7 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("HEARTBEAT.md", .{ .truncate = true });
@@ -926,7 +1058,7 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
         try f.writeAll("- check-2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -943,7 +1075,7 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
@@ -951,7 +1083,7 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -968,7 +1100,7 @@ test "workspacePromptFingerprint changes when AGENTS.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("AGENTS.md", .{ .truncate = true });
@@ -976,7 +1108,7 @@ test "workspacePromptFingerprint changes when AGENTS.md changes" {
         try f.writeAll("startup-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -993,7 +1125,7 @@ test "workspacePromptFingerprint changes when USER.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
@@ -1001,7 +1133,7 @@ test "workspacePromptFingerprint changes when USER.md changes" {
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 

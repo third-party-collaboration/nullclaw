@@ -96,6 +96,10 @@ pub const SecurityPolicy = struct {
             const lower_base = lowerBuf(base);
             const joined_lower = lowerBuf(cmd_part);
 
+            // One explicit escape hatch for onboarding lifecycle:
+            // deleting only BOOTSTRAP.md via rm/trash is considered low risk.
+            if (isSafeBootstrapDeleteCommandSegment(cmd_part)) continue;
+
             // High-risk commands
             if (isHighRiskCommand(lower_base.slice())) return .high;
 
@@ -207,9 +211,17 @@ pub const SecurityPolicy = struct {
 
             has_cmd = true;
 
+            // Allow only the narrow onboarding lifecycle delete command:
+            // rm/trash BOOTSTRAP.md (single safe target only).
+            if (isSafeBootstrapDeleteCommandSegment(cmd_part)) {
+                continue;
+            }
+
             var found = false;
-            for (self.allowed_commands) |allowed| {
-                if (std.mem.eql(u8, allowed, base_cmd)) {
+            for (self.allowed_commands) |raw_allowed| {
+                const allowed = std.mem.trim(u8, raw_allowed, " \t\r\n");
+                if (allowed.len == 0) continue;
+                if (allowlistEntryMatchesBase(allowed, base_cmd)) {
                     found = true;
                     break;
                 }
@@ -424,6 +436,86 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
     return true;
 }
 
+fn trimMatchingQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2) {
+        if ((s[0] == '\'' and s[s.len - 1] == '\'') or
+            (s[0] == '"' and s[s.len - 1] == '"'))
+        {
+            return s[1 .. s.len - 1];
+        }
+    }
+    return s;
+}
+
+fn isSafeBootstrapDeleteTarget(raw_arg: []const u8) bool {
+    const trimmed = trimMatchingQuotes(std.mem.trim(u8, raw_arg, " \t"));
+    if (trimmed.len == 0) return false;
+
+    // No absolute paths, traversal, or globs.
+    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (containsStr(trimmed, "..")) return false;
+    if (containsStr(trimmed, "*") or containsStr(trimmed, "?") or
+        containsStr(trimmed, "[") or containsStr(trimmed, "]"))
+    {
+        return false;
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "BOOTSTRAP.md")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "./BOOTSTRAP.md")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, ".\\BOOTSTRAP.md")) return true;
+    return false;
+}
+
+fn isSafeBootstrapDeleteCommandSegment(cmd_part: []const u8) bool {
+    const trimmed = std.mem.trim(u8, cmd_part, " \t");
+    if (trimmed.len == 0) return false;
+
+    var words = std.mem.tokenizeAny(u8, trimmed, " \t");
+    const first = words.next() orelse return false;
+    const base = lowerBuf(extractBasename(first)).slice();
+    const is_delete_tool = std.mem.eql(u8, base, "rm") or
+        std.mem.eql(u8, base, "trash") or
+        std.mem.eql(u8, base, "trash-put") or
+        std.mem.eql(u8, base, "del");
+    if (!is_delete_tool) return false;
+
+    var saw_target = false;
+    var options_done = false;
+    while (words.next()) |raw_arg| {
+        const arg = std.mem.trim(u8, raw_arg, " \t");
+        if (arg.len == 0) continue;
+
+        if (!options_done and std.mem.eql(u8, arg, "--")) {
+            options_done = true;
+            continue;
+        }
+        if (!options_done and arg[0] == '-') continue;
+        if (!options_done and std.mem.eql(u8, base, "del") and arg[0] == '/') continue;
+
+        if (!isSafeBootstrapDeleteTarget(arg)) return false;
+        saw_target = true;
+    }
+
+    return saw_target;
+}
+
+/// Allowlist entry formats:
+/// - "*" → any base command
+/// - "cmd" → exact base command
+/// - "cmd *" → shell-style wildcard alias for the same base command
+fn allowlistEntryMatchesBase(allowed_entry: []const u8, base_cmd: []const u8) bool {
+    if (std.mem.eql(u8, allowed_entry, "*")) return true;
+    if (std.mem.eql(u8, allowed_entry, base_cmd)) return true;
+
+    var parts = std.mem.tokenizeAny(u8, allowed_entry, " \t");
+    const first = parts.next() orelse return false;
+    const second = parts.next() orelse return false;
+    if (parts.next() != null) return false;
+    if (!std.mem.eql(u8, second, "*")) return false;
+
+    return std.mem.eql(u8, extractBasename(first), base_cmd);
+}
+
 fn containsStr(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
@@ -497,6 +589,26 @@ test "allowed commands basic" {
     try std.testing.expect(p.isCommandAllowed("cargo build --release"));
     try std.testing.expect(p.isCommandAllowed("cat file.txt"));
     try std.testing.expect(p.isCommandAllowed("grep -r pattern ."));
+}
+
+test "bootstrap delete command is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("rm BOOTSTRAP.md"));
+    try std.testing.expect(p.isCommandAllowed("rm -f -- ./BOOTSTRAP.md"));
+    try std.testing.expect(p.isCommandAllowed("trash BOOTSTRAP.md"));
+}
+
+test "bootstrap delete command remains narrow and safe" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("rm BOOTSTRAP.md README.md"));
+    try std.testing.expect(!p.isCommandAllowed("rm ../BOOTSTRAP.md"));
+    try std.testing.expect(!p.isCommandAllowed("rm /tmp/BOOTSTRAP.md"));
+}
+
+test "bootstrap delete command risk and validation" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.low, p.commandRiskLevel("rm BOOTSTRAP.md"));
+    try std.testing.expectEqual(CommandRiskLevel.low, try p.validateCommandExecution("rm BOOTSTRAP.md", false));
 }
 
 test "blocked commands basic" {
@@ -890,6 +1002,73 @@ test "allows double ampersand and-and" {
     try std.testing.expect(p.isCommandAllowed("ls && echo done"));
 }
 
+test "wildcard allowlist permits arbitrary base commands" {
+    var p = SecurityPolicy{ .autonomy = .full };
+    p.allowed_commands = &.{"*"};
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com"));
+    try std.testing.expect(p.isCommandAllowed("python3 --version"));
+}
+
+test "wildcard allowlist still honors high-risk runtime gate" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = true,
+    };
+    try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("curl https://example.com", false));
+}
+
+test "wildcard allowlist with surrounding whitespace permits arbitrary commands" {
+    var p = SecurityPolicy{ .autonomy = .full };
+    p.allowed_commands = &.{"  *  "};
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com"));
+}
+
+test "allowed command entries are trimmed before matching" {
+    var p = SecurityPolicy{ .autonomy = .supervised };
+    p.allowed_commands = &.{ "  ls  ", "\techo\t" };
+    try std.testing.expect(p.isCommandAllowed("ls -la"));
+    try std.testing.expect(p.isCommandAllowed("echo ok"));
+}
+
+test "allowlist command-star entries match base command" {
+    var p = SecurityPolicy{ .autonomy = .full };
+    p.allowed_commands = &.{ "curl *", "wget *" };
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com"));
+    try std.testing.expect(p.isCommandAllowed("wget https://example.com/file.txt"));
+    try std.testing.expect(!p.isCommandAllowed("ls -la"));
+}
+
+test "allowlist command-star entries support absolute command paths" {
+    var p = SecurityPolicy{ .autonomy = .full };
+    p.allowed_commands = &.{"/usr/bin/curl *"};
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com"));
+}
+
+test "allowlist command-star entries still enforce command-specific arg safety" {
+    var p = SecurityPolicy{ .autonomy = .full };
+    p.allowed_commands = &.{"git *"};
+    try std.testing.expect(p.isCommandAllowed("git status"));
+    try std.testing.expect(!p.isCommandAllowed("git config core.editor vim"));
+}
+
+test "allowlist command-star entry reaches high-risk runtime gate" {
+    var blocked = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl *"},
+        .block_high_risk_commands = true,
+    };
+    try std.testing.expectError(error.HighRiskBlocked, blocked.validateCommandExecution("curl https://example.com", false));
+
+    var unblocked = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl *"},
+        .block_high_risk_commands = false,
+    };
+    const risk = try unblocked.validateCommandExecution("curl https://example.com", false);
+    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+}
+
 test "containsSingleAmpersand detects correctly" {
     // These have single & -> should detect
     try std.testing.expect(containsSingleAmpersand("cmd & other"));
@@ -1080,4 +1259,37 @@ test "command at MAX_ANALYSIS_LEN minus one is still analyzed" {
     @memset(buf[3..], 'A');
     try std.testing.expect(p.isCommandAllowed(&buf));
     try std.testing.expectEqual(CommandRiskLevel.low, p.commandRiskLevel(&buf));
+}
+
+test "full autonomy wildcard end-to-end: validateCommandExecution passes" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+    };
+    // High-risk commands pass with full autonomy + wildcard + block_high_risk disabled
+    const risk = try p.validateCommandExecution("curl https://example.com", false);
+    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+
+    // Medium-risk commands pass
+    const risk2 = try p.validateCommandExecution("npm install express", false);
+    try std.testing.expectEqual(CommandRiskLevel.medium, risk2);
+
+    // Low-risk commands pass
+    const risk3 = try p.validateCommandExecution("ls -la", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk3);
+}
+
+test "full autonomy wildcard: arbitrary commands allowed" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+    };
+    try std.testing.expect(p.isCommandAllowed("python3 --version"));
+    try std.testing.expect(p.isCommandAllowed("node -e 'console.log(1)'"));
+    try std.testing.expect(p.isCommandAllowed("pip install flask"));
+    try std.testing.expect(p.isCommandAllowed("cargo build --release"));
+    try std.testing.expect(p.isCommandAllowed("make all"));
+    try std.testing.expect(p.isCommandAllowed("zig build test"));
 }

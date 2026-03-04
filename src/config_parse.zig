@@ -21,6 +21,36 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
 }
 
 fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+    // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
+    if (std.mem.startsWith(u8, primary, "custom:")) {
+        // The format is "custom:<provider_url>/<model>" where <provider_url> may contain slashes.
+        // To preserve model IDs that may also contain '/', split after a versioned API segment:
+        // "/v1/", "/v2/", etc.
+        const proto_start = std.mem.indexOf(u8, primary, "://") orelse return null;
+        var i: usize = proto_start + 3;
+        var model_start: ?usize = null;
+        while (i + 3 < primary.len) : (i += 1) {
+            if (primary[i] != '/' or primary[i + 1] != 'v') continue;
+            var j = i + 2;
+            var has_digit = false;
+            while (j < primary.len and std.ascii.isDigit(primary[j])) : (j += 1) {
+                has_digit = true;
+            }
+            if (!has_digit) continue;
+            if (j < primary.len and primary[j] == '/') {
+                if (j + 1 >= primary.len) return null;
+                model_start = j + 1;
+                break;
+            }
+        }
+        const split_at = model_start orelse return null;
+        return .{
+            .provider = primary[0 .. split_at - 1],
+            .model = primary[split_at..],
+        };
+    }
+
+    // Regular provider/model format (e.g., "openrouter/anthropic/claude-sonnet-4")
     const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
     if (slash == 0 or slash + 1 >= primary.len) return null;
     return .{
@@ -256,7 +286,16 @@ fn parseChannels(self: *Config, channels_value: std.json.Value) !void {
                 },
                 .optional => |opt| {
                     const Child = opt.child;
-                    if (comptime @hasField(Child, "account_id")) {
+                    const info = @typeInfo(Child);
+                    if (info == .pointer and info.pointer.size == .one) {
+                        // ?*T — heap-allocated single config (e.g. NostrConfig)
+                        const Pointee = info.pointer.child;
+                        if (parseInlineChannel(Pointee, self.allocator, channel_value)) |parsed| {
+                            const ptr = try self.allocator.create(Pointee);
+                            ptr.* = parsed;
+                            @field(self.channels, field.name) = ptr;
+                        }
+                    } else if (comptime @hasField(Child, "account_id")) {
                         if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
                             @field(self.channels, field.name) = parsed;
                         }
@@ -280,8 +319,17 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     const root = parsed.value.object;
 
     // Top-level fields
+    if (root.get("workspace")) |v| {
+        if (v == .string) {
+            self.workspace_dir_override = try self.allocator.dupe(u8, v.string);
+            self.workspace_dir = self.workspace_dir_override.?;
+        }
+    }
     if (root.get("default_provider")) |v| {
-        if (v == .string) self.legacy_default_provider_detected = true;
+        if (v == .string) {
+            self.default_provider = try self.allocator.dupe(u8, v.string);
+            self.legacy_default_provider_detected = true;
+        }
     }
     // Legacy key is no longer accepted. Require agents.defaults.model.primary.
     if (root.get("default_model")) |_| {
@@ -343,10 +391,19 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (mdl == .object) {
                             if (mdl.object.get("primary")) |v| {
                                 if (v == .string) {
+                                    // Always try to parse primary field - it may contain full provider/model info
+                                    // or just the model part (when legacy default_provider exists)
                                     if (splitPrimaryModelRef(v.string)) |parsed_ref| {
-                                        self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
                                         self.default_model = try self.allocator.dupe(u8, parsed_ref.model);
-                                    } else {
+                                        // Only update provider if not already set from legacy field
+                                        if (!self.legacy_default_provider_detected) {
+                                            self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
+                                        }
+                                    } else if (self.legacy_default_provider_detected) {
+                                        // Legacy top-level default_provider + model-only primary.
+                                        self.default_model = try self.allocator.dupe(u8, v.string);
+                                    } else if (!self.legacy_default_provider_detected) {
+                                        // Only fail if neither legacy nor new format provides valid data
                                         self.default_provider = "";
                                         self.default_model = null;
                                     }
@@ -509,6 +566,29 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (diag.object.get("log_llm_io")) |v| {
                 if (v == .bool) self.diagnostics.log_llm_io = v.bool;
             }
+            if (diag.object.get("api_error_max_chars")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                    self.diagnostics.api_error_max_chars = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_enabled")) |v| {
+                if (v == .bool) self.diagnostics.token_usage_ledger_enabled = v.bool;
+            }
+            if (diag.object.get("token_usage_ledger_window_hours")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                    self.diagnostics.token_usage_ledger_window_hours = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_max_bytes")) |v| {
+                if (v == .integer and v.integer >= 0) {
+                    self.diagnostics.token_usage_ledger_max_bytes = @intCast(v.integer);
+                }
+            }
+            if (diag.object.get("token_usage_ledger_max_lines")) |v| {
+                if (v == .integer and v.integer >= 0) {
+                    self.diagnostics.token_usage_ledger_max_lines = @intCast(v.integer);
+                }
+            }
             if (diag.object.get("otel")) |otel| {
                 if (otel == .object) {
                     if (otel.object.get("endpoint")) |v| {
@@ -664,6 +744,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (sch.object.get("max_concurrent")) |v| {
                 if (v == .integer) self.scheduler.max_concurrent = @intCast(v.integer);
             }
+            if (sch.object.get("agent_timeout_secs")) |v| {
+                if (v == .integer and v.integer >= 0) self.scheduler.agent_timeout_secs = @intCast(v.integer);
+            }
         }
     }
 
@@ -717,6 +800,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.agent.token_limit = @intCast(v.integer);
                     self.agent.token_limit_explicit = true;
                 }
+            }
+            if (ag.object.get("status_show_emojis")) |v| {
+                if (v == .bool) self.agent.status_show_emojis = v.bool;
             }
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
@@ -838,6 +924,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             };
                             if (store.get("pgvector_table")) |v| if (v == .string) {
                                 self.memory.search.store.pgvector_table = try self.allocator.dupe(u8, v.string);
+                            };
+                            if (store.get("ann_candidate_multiplier")) |v| if (v == .integer) {
+                                if (v.integer >= 0) {
+                                    const raw_u64: u64 = @intCast(v.integer);
+                                    const clamped_u64 = @min(raw_u64, @as(u64, std.math.maxInt(u32)));
+                                    self.memory.search.store.ann_candidate_multiplier = @intCast(clamped_u64);
+                                }
+                            };
+                            if (store.get("ann_min_candidates")) |v| if (v == .integer) {
+                                if (v.integer >= 0) {
+                                    const raw_u64: u64 = @intCast(v.integer);
+                                    const clamped_u64 = @min(raw_u64, @as(u64, std.math.maxInt(u32)));
+                                    self.memory.search.store.ann_min_candidates = @intCast(clamped_u64);
+                                }
                             };
                         }
                     }
@@ -1408,6 +1508,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (hr.object.get("allowed_domains")) |v| {
                 if (v == .array) self.http_request.allowed_domains = try parseStringArray(self.allocator, v.array);
             }
+            if (hr.object.get("proxy")) |v| {
+                if (v == .string) self.http_request.proxy = try self.allocator.dupe(u8, v.string);
+            }
+            if (hr.object.get("search_base_url")) |v| {
+                if (v == .string) self.http_request.search_base_url = try self.allocator.dupe(u8, v.string);
+            }
+            if (hr.object.get("search_provider")) |v| {
+                if (v == .string) self.http_request.search_provider = try self.allocator.dupe(u8, v.string);
+            }
+            if (hr.object.get("search_fallback_providers")) |v| {
+                if (v == .array) self.http_request.search_fallback_providers = try parseStringArray(self.allocator, v.array);
+            }
         }
     }
 
@@ -1566,6 +1678,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("native_tools")) |nt| {
                             if (nt == .bool) pe.native_tools = nt.bool;
                         }
+                        if (val.object.get("user_agent")) |ua| {
+                            if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
+                        }
                         try prov_list.append(self.allocator, pe);
                     }
                     self.providers = try prov_list.toOwnedSlice(self.allocator);
@@ -1605,6 +1720,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             const typing_val = sess.object.get("typing_interval_secs");
             if (typing_val) |v| {
                 if (v == .integer) self.session.typing_interval_secs = @intCast(v.integer);
+            }
+            const concurrent_val = sess.object.get("max_concurrent_tasks");
+            if (concurrent_val) |v| {
+                if (v == .integer) self.session.max_concurrent_tasks = @intCast(v.integer);
             }
             const links_val = sess.object.get("identity_links");
             if (links_val) |links| {

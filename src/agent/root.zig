@@ -18,6 +18,7 @@ const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
@@ -210,11 +211,22 @@ pub const Agent = struct {
         }
     };
 
+    pub const UsageRecord = struct {
+        ts: i64,
+        provider: []const u8,
+        model: []const u8,
+        usage: providers.TokenUsage,
+        success: bool,
+    };
+
+    pub const UsageRecordCallback = *const fn (ctx: *anyopaque, record: UsageRecord) void;
+
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
     tool_specs: []const ToolSpec,
     mem: ?Memory,
+    bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*cache.ResponseCache = null,
     /// Optional MemoryRuntime pointer for diagnostics (e.g. /doctor command).
@@ -270,6 +282,7 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
     log_llm_io: bool = false,
@@ -284,6 +297,10 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Optional callback invoked for each LLM response usage record.
+    usage_record_callback: ?UsageRecordCallback = null,
+    /// Context pointer passed to usage_record_callback.
+    usage_record_ctx: ?*anyopaque = null,
     /// Conversation context for the current turn (Signal-specific for now).
     conversation_context: ?prompt.ConversationContext = null,
 
@@ -346,12 +363,20 @@ pub const Agent = struct {
             };
         }
 
+        const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
+            allocator,
+            cfg.memory.backend,
+            mem,
+            cfg.workspace_dir,
+        ) catch null;
+
         return .{
             .allocator = allocator,
             .provider = provider_i,
             .tools = tools,
             .tool_specs = specs,
             .mem = mem,
+            .bootstrap = bootstrap_provider,
             .observer = observer_i,
             .model_name = default_model,
             .default_provider = cfg.default_provider,
@@ -370,12 +395,22 @@ pub const Agent = struct {
             .max_tokens = resolved_max_tokens,
             .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
+            .status_show_emojis = cfg.agent.status_show_emojis,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
             .log_llm_io = cfg.diagnostics.log_llm_io,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .exec_security = switch (cfg.autonomy.level) {
+                .full => .full,
+                .read_only => .deny,
+                .supervised => .allowlist,
+            },
+            .exec_ask = switch (cfg.autonomy.level) {
+                .full, .read_only => .off,
+                .supervised => .on_miss,
+            },
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -384,6 +419,7 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -412,6 +448,7 @@ pub const Agent = struct {
             .token_limit = self.token_limit,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
+            .bootstrap_provider = self.bootstrap,
         });
     }
 
@@ -658,7 +695,7 @@ pub const Agent = struct {
         };
 
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
         }
@@ -685,6 +722,7 @@ pub const Agent = struct {
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
+                .bootstrap_provider = self.bootstrap,
             });
             defer self.allocator.free(system_prompt);
 
@@ -792,7 +830,7 @@ pub const Agent = struct {
             const messages = try self.buildProviderMessages(arena);
 
             const timer_start = std.time.milliTimestamp();
-            const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
+            const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
@@ -825,6 +863,7 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+                    self.emitUsageFailure();
                     return err;
                 };
                 response = ChatResponse{
@@ -883,7 +922,10 @@ pub const Agent = struct {
                             },
                             self.model_name,
                             self.temperature,
-                        ) catch return err;
+                        ) catch |retry_after_compact_err| {
+                            self.emitUsageFailure();
+                            return retry_after_compact_err;
+                        };
                     }
 
                     // Retry once
@@ -924,8 +966,12 @@ pub const Agent = struct {
                                 },
                                 self.model_name,
                                 self.temperature,
-                            ) catch return retry_err;
+                            ) catch |retry_after_compact_err| {
+                                self.emitUsageFailure();
+                                return retry_after_compact_err;
+                            };
                         }
+                        self.emitUsageFailure();
                         return retry_err;
                     };
                 };
@@ -945,6 +991,7 @@ pub const Agent = struct {
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
             self.last_turn_usage = response.usage;
+            self.emitUsageRecord(&response, true);
 
             const response_text = response.contentOrEmpty();
             const use_native = response.hasToolCalls();
@@ -1008,8 +1055,16 @@ pub const Agent = struct {
                 assistant_history_content = response_text;
             }
 
-            // Determine display text
-            const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+            // Determine display text.
+            // When tool calls are present, only show parsed plain text (if any).
+            // Never fall back to raw response_text here, otherwise markup like
+            // <tool_call>...</tool_call> can leak to users.
+            const display_text = if (parsed_calls.len > 0)
+                parsed_text
+            else if (parsed_text.len > 0)
+                parsed_text
+            else
+                response_text;
 
             if (parsed_calls.len == 0) {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
@@ -1178,6 +1233,7 @@ pub const Agent = struct {
                     .tool = call.name,
                     .duration_ms = tool_duration,
                     .success = result.success,
+                    .detail = if (result.success) null else result.output,
                 } };
                 self.observer.recordEvent(&tool_event);
 
@@ -1377,8 +1433,10 @@ pub const Agent = struct {
             }
         }
 
+        const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
+
         for (self.tools) |t| {
-            if (std.mem.eql(u8, t.name(), call.name)) {
+            if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
                     std.json.Value,
@@ -1494,12 +1552,13 @@ pub const Agent = struct {
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
                 attempt,
-                if (response.model.len > 0) response.model else self.model_name,
+                self.effectiveProvider(response),
+                self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
@@ -1539,6 +1598,36 @@ pub const Agent = struct {
                 },
             );
         }
+    }
+
+    fn effectiveProvider(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.provider.len > 0) return response.provider;
+        return self.provider.getName();
+    }
+
+    fn effectiveModel(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.model.len > 0) return response.model;
+        return self.model_name;
+    }
+
+    fn emitUsageRecord(self: *Agent, response: *const ChatResponse, success: bool) void {
+        const cb = self.usage_record_callback orelse return;
+        const ctx = self.usage_record_ctx orelse return;
+        cb(ctx, .{
+            .ts = std.time.timestamp(),
+            .provider = self.effectiveProvider(response),
+            .model = self.effectiveModel(response),
+            .usage = response.usage,
+            .success = success,
+        });
+    }
+
+    fn emitUsageFailure(self: *Agent) void {
+        const failed = ChatResponse{
+            .model = self.model_name,
+            .usage = .{},
+        };
+        self.emitUsageRecord(&failed, false);
     }
 
     /// Build provider-ready ChatMessage slice from owned history.
@@ -1621,6 +1710,7 @@ pub const Agent = struct {
             if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
         }
         if (resp.tool_calls.len > 0) self.allocator.free(resp.tool_calls);
+        if (resp.provider.len > 0) self.allocator.free(resp.provider);
         if (resp.model.len > 0) self.allocator.free(resp.model);
         if (resp.reasoning_content) |rc| {
             if (rc.len > 0) self.allocator.free(rc);
@@ -1628,6 +1718,7 @@ pub const Agent = struct {
         // Mark as consumed to prevent double-free
         resp.content = null;
         resp.tool_calls = &.{};
+        resp.provider = "";
         resp.model = "";
         resp.reasoning_content = null;
     }
@@ -2474,6 +2565,23 @@ test "Agent.fromConfig clamps max_tokens to token_limit" {
     try std.testing.expectEqual(@as(u32, 4096), agent.max_tokens);
 }
 
+test "Agent.fromConfig applies status_show_emojis flag" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.status_show_emojis = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.status_show_emojis);
+}
+
 test "slash /new clears history" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -2704,8 +2812,24 @@ test "slash /status returns agent info" {
     const response = (try agent.handleSlashCommand("/status")).?;
     defer allocator.free(response);
 
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊 NullClaw ") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "42") != null);
+}
+
+test "slash /status can render without emojis" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.status_show_emojis = false;
+
+    const response = (try agent.handleSlashCommand("/status")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "NullClaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Model:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "🧠") == null);
 }
 
 test "slash /whoami returns current session id" {
@@ -4090,6 +4214,105 @@ test "Agent streaming fields can be set" {
     try std.testing.expect(agent.stream_ctx != null);
 }
 
+test "Agent falls back to blocking chat when stream ctx is missing" {
+    const allocator = std.testing.allocator;
+
+    const StreamGuardProvider = struct {
+        chat_calls: usize = 0,
+        stream_calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            return error.ShouldNotStream;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "stream-guard";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = StreamGuardProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamGuardProvider.chatWithSystem,
+        .chat = StreamGuardProvider.chat,
+        .supportsNativeTools = StreamGuardProvider.supportsNativeTools,
+        .getName = StreamGuardProvider.getName,
+        .deinit = StreamGuardProvider.deinitFn,
+        .supports_streaming = StreamGuardProvider.supportsStreaming,
+        .stream_chat = StreamGuardProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const test_cb: providers.StreamCallback = struct {
+        fn cb(_: *anyopaque, _: providers.StreamChunk) void {}
+    }.cb;
+    agent.stream_callback = test_cb;
+    agent.stream_ctx = null;
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.stream_calls);
+}
+
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
@@ -4103,4 +4326,159 @@ test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent.fromConfig sets exec_security=full for full autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
+}
+
+test "Agent.fromConfig sets exec_security=deny for read_only autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .read_only;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .deny);
+    try std.testing.expect(agent.exec_ask == .off);
+}
+
+test "Agent.fromConfig sets exec_security=allowlist for supervised autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .supervised;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .allowlist);
+    try std.testing.expect(agent.exec_ask == .on_miss);
+}
+
+test "execBlockMessage allows all commands when exec_security=full" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .full;
+    agent.exec_ask = .off;
+
+    // Even high-risk commands should not be blocked by execBlockMessage
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "rm -rf /tmp/test" });
+    try std.testing.expect(agent.execBlockMessage(args1) == null);
+
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
+    try std.testing.expect(agent.execBlockMessage(args2) == null);
+
+    var args3 = std.json.ObjectMap.init(allocator);
+    defer args3.deinit();
+    try args3.put("command", .{ .string = "ls -la" });
+    try std.testing.expect(agent.execBlockMessage(args3) == null);
+}
+
+test "execBlockMessage checks allowlist when exec_security=allowlist" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 100);
+    defer tracker.deinit();
+
+    const allowed = [_][]const u8{ "ls", "cat" };
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
+    agent.policy = &policy;
+
+    // Allowed command passes
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "ls -la" });
+    try std.testing.expect(agent.execBlockMessage(args1) == null);
+
+    // Disallowed command is blocked
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
+    try std.testing.expect(agent.execBlockMessage(args2) != null);
+}
+
+test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker_open = policy_mod.RateTracker.init(allocator, 10000);
+    defer tracker_open.deinit();
+
+    var open_policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker_open,
+    };
+
+    var tracker_restricted = policy_mod.RateTracker.init(allocator, 10000);
+    defer tracker_restricted.deinit();
+    const restricted_allowed = [_][]const u8{"ls"};
+    var restricted_policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &restricted_allowed,
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker_restricted,
+    };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
+
+    // Command outside default allowlist should pass with wildcard policy.
+    agent.policy = &open_policy;
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("command", .{ .string = "python3 script.py" });
+    try std.testing.expect(agent.execBlockMessage(args) == null);
+
+    // Same command should be blocked under restrictive allowlist.
+    agent.policy = &restricted_policy;
+    try std.testing.expect(agent.execBlockMessage(args) != null);
 }

@@ -39,6 +39,11 @@ const CompatProvider = struct {
     merge_system_into_user: bool = false,
     /// Authentication style (default: Bearer token).
     auth_style: compatible.AuthStyle = .bearer,
+    /// Whether this provider supports native OpenAI-style tool_calls.
+    native_tools: bool = true,
+    /// When set, cap max_tokens in non-streaming requests to this value.
+    /// Fireworks rejects max_tokens > 4096 when stream=false.
+    max_tokens_non_streaming: ?u32 = null,
 };
 
 const compat_providers = [_]CompatProvider{
@@ -51,6 +56,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "cerebras", .url = "https://api.cerebras.ai/v1", .display = "Cerebras" },
     .{ .name = "perplexity", .url = "https://api.perplexity.ai", .display = "Perplexity" },
     .{ .name = "cohere", .url = "https://api.cohere.com/compatibility", .display = "Cohere" },
+    .{ .name = "telnyx", .url = "https://api.telnyx.com/v2/ai", .display = "Telnyx" },
 
     // ── Gateways & Aggregators ────────────────────────────────────────────
     .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
@@ -58,8 +64,8 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "together", .url = "https://api.together.xyz", .display = "Together AI" },
     .{ .name = "together-ai", .url = "https://api.together.xyz", .display = "Together AI" },
-    .{ .name = "fireworks", .url = "https://api.fireworks.ai/inference/v1", .display = "Fireworks AI" },
-    .{ .name = "fireworks-ai", .url = "https://api.fireworks.ai/inference/v1", .display = "Fireworks AI" },
+    .{ .name = "fireworks", .url = "https://api.fireworks.ai/inference/v1", .display = "Fireworks AI", .max_tokens_non_streaming = 4096 },
+    .{ .name = "fireworks-ai", .url = "https://api.fireworks.ai/inference/v1", .display = "Fireworks AI", .max_tokens_non_streaming = 4096 },
     .{ .name = "huggingface", .url = "https://router.huggingface.co/v1", .display = "Hugging Face" },
     .{ .name = "aihubmix", .url = "https://aihubmix.com/v1", .display = "AIHubMix" },
     .{ .name = "siliconflow", .url = "https://api.siliconflow.cn/v1", .display = "SiliconFlow" },
@@ -74,11 +80,11 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — general ─────────────────────────────────────────
     .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
     .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "qianfan", .url = "https://aip.baidubce.com", .display = "Qianfan" },
@@ -90,26 +96,26 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — CN endpoints ────────────────────────────────────
     .{ .name = "moonshot-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
-    .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
+    .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
 
     // ── International variants ────────────────────────────────────────────
     .{ .name = "moonshot-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true },
-    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI" },
-    .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
-    .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
-    .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true },
+    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false },
+    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false },
+    .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
+    .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
+    .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false },
     .{ .name = "qwen-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "dashscope-intl", .url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
     .{ .name = "qwen-us", .url = "https://dashscope-us.aliyuncs.com/compatible-mode/v1", .display = "Qwen" },
@@ -265,6 +271,7 @@ pub const ProviderHolder = union(enum) {
         api_key: ?[]const u8,
         base_url: ?[]const u8,
         native_tools: bool,
+        user_agent: ?[]const u8,
     ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
@@ -276,7 +283,7 @@ pub const ProviderHolder = union(enum) {
                 else
                     base_url,
             ) },
-            .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key) },
+            .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent) },
             .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
             .ollama_provider => .{ .ollama = ollama.OllamaProvider.init(allocator, base_url) },
             .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
@@ -296,16 +303,19 @@ pub const ProviderHolder = union(enum) {
                     url,
                     api_key,
                     if (cp) |c| c.auth_style else .bearer,
+                    user_agent,
                 );
 
                 // Apply flags from the compat_providers table.
                 if (cp) |c| {
                     if (c.no_responses_fallback) prov.supports_responses_fallback = false;
                     if (c.merge_system_into_user) prov.merge_system_into_user = true;
+                    if (!c.native_tools) prov.native_tools = false;
+                    if (c.max_tokens_non_streaming) |cap| prov.max_tokens_non_streaming = cap;
                 }
 
-                // Apply config-level native_tools override.
-                prov.native_tools = native_tools;
+                // Apply config-level native_tools override (can only force to false).
+                if (!native_tools) prov.native_tools = false;
 
                 break :blk .{ .compatible = prov };
             },
@@ -327,6 +337,7 @@ pub const ProviderHolder = union(enum) {
                     url,
                     api_key,
                     .bearer,
+                    user_agent,
                 );
                 prov.native_tools = native_tools;
                 break :blk .{ .compatible = prov };
@@ -420,6 +431,7 @@ test "compatibleProviderUrl new providers" {
     try std.testing.expectEqualStrings("https://chutes.ai/api/v1", compatibleProviderUrl("chutes").?);
     try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", compatibleProviderUrl("kimi-code").?);
     try std.testing.expectEqualStrings("https://portal.qwen.ai/v1", compatibleProviderUrl("qwen-portal").?);
+    try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", compatibleProviderUrl("telnyx").?);
 }
 
 test "compatibleProviderUrl CN/intl variants" {
@@ -460,6 +472,7 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("vLLM", compatibleProviderDisplayName("vllm"));
     try std.testing.expectEqualStrings("OVHcloud", compatibleProviderDisplayName("ovhcloud"));
     try std.testing.expectEqualStrings("Custom", compatibleProviderDisplayName("nonexistent"));
+    try std.testing.expectEqualStrings("Telnyx", compatibleProviderDisplayName("telnyx"));
 }
 
 test "new providers classify as compatible" {
@@ -469,6 +482,7 @@ test "new providers classify as compatible" {
     try std.testing.expect(classifyProvider("lmstudio") == .compatible_provider);
     try std.testing.expect(classifyProvider("lm-studio") == .compatible_provider);
     try std.testing.expect(classifyProvider("astrai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("telnyx") == .compatible_provider);
 }
 
 test "findCompatProvider returns correct flags" {
@@ -491,11 +505,15 @@ test "findCompatProvider returns correct flags" {
     const minimax_cn = findCompatProvider("minimax-cn").?;
     try std.testing.expect(minimax_cn.no_responses_fallback);
     try std.testing.expect(minimax_cn.merge_system_into_user);
+
+    // Fireworks has non-streaming max_tokens cap.
+    const fireworks = findCompatProvider("fireworks").?;
+    try std.testing.expectEqual(@as(?u32, 4096), fireworks.max_tokens_non_streaming);
 }
 
 test "fromConfig applies no_responses_fallback flag" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true);
+    var h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(!h.compatible.supports_responses_fallback);
@@ -503,11 +521,28 @@ test "fromConfig applies no_responses_fallback flag" {
 
 test "fromConfig applies merge_system_into_user flag" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true);
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(h.compatible.merge_system_into_user);
     try std.testing.expect(!h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig inherits native_tools=false from table" {
+    const alloc = std.testing.allocator;
+    // minimax has native_tools = false in table
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expect(!h.compatible.native_tools);
+}
+
+test "fromConfig applies max_tokens_non_streaming from table" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "fireworks", "key", null, true, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqual(@as(?u32, 4096), h.compatible.max_tokens_non_streaming);
 }
 
 test "detectProviderByApiKey openrouter" {
@@ -565,44 +600,49 @@ test "ProviderHolder tagged union has all expected fields" {
 test "ProviderHolder.fromConfig routes to correct variant" {
     const alloc = std.testing.allocator;
     // anthropic
-    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null, true);
+    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null, true, null);
     defer h1.deinit();
     try std.testing.expect(h1 == .anthropic);
     // openai
-    var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true);
+    var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null);
     defer h2.deinit();
     try std.testing.expect(h2 == .openai);
     // gemini
-    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true);
+    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null);
     defer h3.deinit();
     try std.testing.expect(h3 == .gemini);
     // ollama
-    var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true);
+    var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true, null);
     defer h4.deinit();
     try std.testing.expect(h4 == .ollama);
     // openrouter
-    var h5 = ProviderHolder.fromConfig(alloc, "openrouter", "sk-or-test", null, true);
+    var h5 = ProviderHolder.fromConfig(alloc, "openrouter", "sk-or-test", null, true, null);
     defer h5.deinit();
     try std.testing.expect(h5 == .openrouter);
     // compatible (groq)
-    var h6 = ProviderHolder.fromConfig(alloc, "groq", "gsk_test", null, true);
+    var h6 = ProviderHolder.fromConfig(alloc, "groq", "gsk_test", null, true, null);
     defer h6.deinit();
     try std.testing.expect(h6 == .compatible);
+    // compatible (telnyx from built-in table URL)
+    var h6b = ProviderHolder.fromConfig(alloc, "telnyx", "test-key", null, true, null);
+    defer h6b.deinit();
+    try std.testing.expect(h6b == .compatible);
+    try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", h6b.compatible.base_url);
     // openai-codex
-    var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true);
+    var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true, null);
     defer h7.deinit();
     try std.testing.expect(h7 == .openai_codex);
     // unknown falls back to openrouter
-    var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key", null, true);
+    var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key", null, true, null);
     defer h8.deinit();
     try std.testing.expect(h8 == .openrouter);
     // anthropic-custom prefix
-    var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test", null, true);
+    var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test", null, true, null);
     defer h9.deinit();
     try std.testing.expect(h9 == .anthropic);
 }
 
 test "compat_providers table count" {
     // Verify we have the expected number of entries (guard against accidental deletions).
-    try std.testing.expect(compat_providers.len >= 88);
+    try std.testing.expect(compat_providers.len >= 89);
 }

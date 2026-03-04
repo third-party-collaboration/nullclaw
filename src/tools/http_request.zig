@@ -5,11 +5,14 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
 
+const log = std.log.scoped(.http_request);
+
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods with
 /// domain allowlisting, SSRF protection, and header redaction.
 pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
+    max_response_size: u32 = 1_000_000,
 
     pub const tool_name = "http_request";
     pub const tool_description = "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++
@@ -107,6 +110,12 @@ pub const HttpRequestTool = struct {
         defer client.deinit();
 
         const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
+        if (protocol == .tls) {
+            ensureTlsCaBundleLoaded(&client) catch |err| {
+                const msg = try buildHttpRequestErrorMessage(allocator, "HTTP request failed", err);
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+        }
         const authority_host = stripHostBrackets(host);
         const connection = client.connectTcpOptions(.{
             .host = connect_host,
@@ -115,7 +124,8 @@ pub const HttpRequestTool = struct {
             .proxied_host = authority_host,
             .proxied_port = resolved_port,
         }) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
+            log.err("HTTP request connection failed for {s}: {}", .{ url, err });
+            const msg = try buildHttpRequestErrorMessage(allocator, "HTTP request failed", err);
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
 
@@ -164,7 +174,7 @@ pub const HttpRequestTool = struct {
         // Read response body (limit to 1MB)
         var transfer_buf: [8192]u8 = undefined;
         const reader = response.reader(&transfer_buf);
-        const response_body = reader.readAlloc(allocator, 1_048_576) catch |err| {
+        const response_body = reader.readAlloc(allocator, @intCast(self.max_response_size)) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to read response body: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -195,6 +205,36 @@ pub const HttpRequestTool = struct {
         }
     }
 };
+
+fn ensureTlsCaBundleLoaded(client: *std.http.Client) !void {
+    if (@atomicLoad(bool, &client.next_https_rescan_certs, .acquire)) {
+        client.ca_bundle_mutex.lock();
+        defer client.ca_bundle_mutex.unlock();
+
+        if (client.next_https_rescan_certs) {
+            client.ca_bundle.rescan(client.allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.CertificateBundleLoadFailure,
+            };
+            @atomicStore(bool, &client.next_https_rescan_certs, false, .release);
+        }
+    }
+}
+
+fn isTlsSetupError(err: anyerror) bool {
+    return err == error.TlsInitializationFailed or err == error.CertificateBundleLoadFailure;
+}
+
+fn buildHttpRequestErrorMessage(allocator: std.mem.Allocator, prefix: []const u8, err: anyerror) ![]u8 {
+    if (isTlsSetupError(err)) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}: {s}. Ensure system CA certificates are available in the runtime, or use an endpoint with a publicly trusted certificate chain.",
+            .{ prefix, @errorName(err) },
+        );
+    }
+    return std.fmt.allocPrint(allocator, "{s}: {}", .{ prefix, err });
+}
 
 fn validateMethod(method: []const u8) ?std.http.Method {
     if (std.ascii.eqlIgnoreCase(method, "GET")) return .GET;
@@ -558,6 +598,18 @@ test "validateMethod rejects empty string" {
 test "validateMethod rejects CONNECT TRACE" {
     try std.testing.expect(validateMethod("CONNECT") == null);
     try std.testing.expect(validateMethod("TRACE") == null);
+}
+
+test "isTlsSetupError detects TLS setup failures" {
+    try std.testing.expect(isTlsSetupError(error.TlsInitializationFailed));
+    try std.testing.expect(isTlsSetupError(error.CertificateBundleLoadFailure));
+    try std.testing.expect(!isTlsSetupError(error.EndOfStream));
+}
+
+test "buildHttpRequestErrorMessage includes TLS hint" {
+    const msg = try buildHttpRequestErrorMessage(std.testing.allocator, "HTTP request failed", error.TlsInitializationFailed);
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "system CA certificates") != null);
 }
 
 // ── parseHeaders tests ──────────────────────────────────────
